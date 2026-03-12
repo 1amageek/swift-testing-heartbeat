@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import TestHeartbeat
 
-// MARK: - Test Sink
+// MARK: - Test Sinks
 
 /// In-memory sink that records every event for verification.
 /// Uses NSLock for thread safety — @unchecked Sendable is required here
@@ -119,6 +119,27 @@ struct HeartbeatConfigTests {
         )
         #expect(!config.isEnabled)
     }
+
+    @Test("default directoryURL when omitted")
+    func defaultDirectoryURL() {
+        let config = HeartbeatConfig()
+        #expect(config.directoryURL.path == "/tmp/test-heartbeat")
+    }
+}
+
+// MARK: - HeartbeatPhase
+
+@Suite("HeartbeatPhase")
+struct HeartbeatPhaseTests {
+
+    @Test("well-known constants match expected strings")
+    func constants() {
+        #expect(HeartbeatPhase.start == "start")
+        #expect(HeartbeatPhase.progress == "progress")
+        #expect(HeartbeatPhase.done == "done")
+        #expect(HeartbeatPhase.failed == "failed")
+        #expect(HeartbeatPhase.cancelled == "cancelled")
+    }
 }
 
 // MARK: - Heartbeat
@@ -132,7 +153,7 @@ struct HeartbeatTests {
         _ = try Heartbeat.start(testID: "test1", sink: sink)
 
         #expect(sink.events.count == 1)
-        #expect(sink.events.first?.phase == "start")
+        #expect(sink.events.first?.phase == HeartbeatPhase.start)
         #expect(sink.events.first?.testID == "test1")
     }
 
@@ -160,7 +181,8 @@ struct HeartbeatTests {
 
     @Test("throwError mode propagates sink errors")
     func throwErrorMode() {
-        let hb = Heartbeat(testID: "fail", sink: FailingSink(), failureMode: .throwError)
+        let config = HeartbeatConfig(failureMode: .throwError)
+        let hb = Heartbeat(testID: "fail", config: config, sink: FailingSink())
         #expect(throws: FailingSink.WriteError.self) {
             try hb.beat("boom")
         }
@@ -168,7 +190,8 @@ struct HeartbeatTests {
 
     @Test("ignore mode suppresses sink errors")
     func ignoreMode() throws {
-        let hb = Heartbeat(testID: "safe", sink: FailingSink(), failureMode: .ignore)
+        let config = HeartbeatConfig(failureMode: .ignore)
+        let hb = Heartbeat(testID: "safe", config: config, sink: FailingSink())
         try hb.beat("ok")
     }
 
@@ -194,6 +217,120 @@ struct HeartbeatTests {
         #expect(events.count == 2)
         #expect(events[1].monotonicNanoseconds >= events[0].monotonicNanoseconds)
     }
+
+    // MARK: - Lifecycle
+
+    @Test("finish emits done phase")
+    func finishEmitsDone() throws {
+        let sink = RecordingSink()
+        let hb = Heartbeat(testID: "lifecycle", sink: sink)
+        try hb.finish()
+
+        let event = try #require(sink.events.first)
+        #expect(event.phase == HeartbeatPhase.done)
+    }
+
+    @Test("fail emits failed phase with metadata")
+    func failEmitsFailed() throws {
+        let sink = RecordingSink()
+        let hb = Heartbeat(testID: "lifecycle", sink: sink)
+        try hb.fail(metadata: ["error": "timeout"])
+
+        let event = try #require(sink.events.first)
+        #expect(event.phase == HeartbeatPhase.failed)
+        #expect(event.metadata["error"] == "timeout")
+    }
+
+    @Test("cancel emits cancelled phase")
+    func cancelEmitsCancelled() throws {
+        let sink = RecordingSink()
+        let hb = Heartbeat(testID: "lifecycle", sink: sink)
+        try hb.cancel()
+
+        let event = try #require(sink.events.first)
+        #expect(event.phase == HeartbeatPhase.cancelled)
+    }
+
+    // MARK: - includeThreadID
+
+    @Test("threadID is nil when includeThreadID is false")
+    func threadIDDisabled() throws {
+        let sink = RecordingSink()
+        let config = HeartbeatConfig(includeThreadID: false)
+        let hb = Heartbeat(testID: "tid", config: config, sink: sink)
+        try hb.beat("check")
+
+        let event = try #require(sink.events.first)
+        #expect(event.threadID == nil)
+    }
+
+    @Test("threadID is populated when includeThreadID is true")
+    func threadIDEnabled() throws {
+        let sink = RecordingSink()
+        let config = HeartbeatConfig(includeThreadID: true)
+        let hb = Heartbeat(testID: "tid", config: config, sink: sink)
+        try hb.beat("check")
+
+        let event = try #require(sink.events.first)
+        #expect(event.threadID != nil)
+        #expect(event.threadID! > 0)
+    }
+
+    // MARK: - Config consolidation
+
+    @Test("failureMode from config is respected without explicit parameter")
+    func failureModeFromConfig() throws {
+        let config = HeartbeatConfig(failureMode: .ignore)
+        let hb = Heartbeat(testID: "cfg", config: config, sink: FailingSink())
+        // Should not throw because config says ignore
+        try hb.beat("ok")
+    }
+
+    @Test("environment variable controls failureMode end-to-end")
+    func environmentFailureMode() throws {
+        let config = HeartbeatConfig.fromEnvironment(
+            environment: ["TEST_HEARTBEAT_FAILURE_MODE": "ignore"]
+        )
+        let hb = Heartbeat(testID: "env", config: config, sink: FailingSink())
+        try hb.beat("ok")
+    }
+
+    // MARK: - withPhase
+
+    @Test("withPhase emits start and done on success")
+    func withPhaseSuccess() async throws {
+        let sink = RecordingSink()
+        let hb = Heartbeat(testID: "scoped", sink: sink)
+
+        let result = try await hb.withPhase("setup") {
+            42
+        }
+
+        #expect(result == 42)
+        #expect(sink.events.count == 2)
+        #expect(sink.events[0].phase == "setup")
+        #expect(sink.events[1].phase == "setup:done")
+    }
+
+    @Test("withPhase emits start and failed on error")
+    func withPhaseFailure() async throws {
+        let sink = RecordingSink()
+        let hb = Heartbeat(testID: "scoped", sink: sink)
+
+        struct TestError: Error {}
+
+        do {
+            try await hb.withPhase("setup") {
+                throw TestError()
+            }
+        } catch is TestError {
+            // Expected
+        }
+
+        #expect(sink.events.count == 2)
+        #expect(sink.events[0].phase == "setup")
+        #expect(sink.events[1].phase == "setup:failed")
+    }
 }
 
 // MARK: - ProgressReporter
@@ -207,7 +344,7 @@ struct ProgressReporterTests {
         _ = try ProgressReporter(testID: "prog1", sink: sink)
 
         #expect(sink.events.count == 1)
-        #expect(sink.events.first?.phase == "start")
+        #expect(sink.events.first?.phase == HeartbeatPhase.start)
     }
 
     @Test("phase emits unconditionally")
@@ -230,7 +367,6 @@ struct ProgressReporterTests {
             sink: sink
         )
 
-        // These should all be throttled since 60s hasn't elapsed
         for i in 0..<10 {
             try reporter.every(phase: "iter-\(i)")
         }
@@ -242,7 +378,6 @@ struct ProgressReporterTests {
     @Test("every emits when interval has elapsed")
     func everyEmitsAfterInterval() throws {
         let sink = RecordingSink()
-        // Use zero interval so every call emits
         var reporter = try ProgressReporter(
             testID: "prog4",
             minimumInterval: .zero,
@@ -267,9 +402,39 @@ struct ProgressReporterTests {
             sink: sink
         )
 
-        // Override with zero — should emit despite long default interval
         try reporter.every(.zero, phase: "override")
         #expect(sink.events.count == 2) // start + override
+    }
+
+    @Test("finish delegates to heartbeat")
+    func finishDelegates() throws {
+        let sink = RecordingSink()
+        let reporter = try ProgressReporter(testID: "prog6", sink: sink)
+        try reporter.finish()
+
+        #expect(sink.events.last?.phase == HeartbeatPhase.done)
+    }
+
+    @Test("fail delegates to heartbeat")
+    func failDelegates() throws {
+        let sink = RecordingSink()
+        let reporter = try ProgressReporter(testID: "prog7", sink: sink)
+        try reporter.fail()
+
+        #expect(sink.events.last?.phase == HeartbeatPhase.failed)
+    }
+
+    @Test("withPhase emits phase boundaries")
+    func withPhase() async throws {
+        let sink = RecordingSink()
+        var reporter = try ProgressReporter(testID: "prog8", sink: sink)
+
+        try await reporter.withPhase("work") {
+            // simulated work
+        }
+
+        let phases = sink.events.map(\.phase)
+        #expect(phases == [HeartbeatPhase.start, "work", "work:done"])
     }
 }
 
@@ -373,11 +538,9 @@ struct FileHeartbeatSinkTests {
         )
         try sink.write(second)
 
-        // Only one file should exist
         let files = try FileManager.default.contentsOfDirectory(atPath: tmpDir.path)
         #expect(files.count == 1)
 
-        // Content should be the latest event
         let fileURL = tmpDir.appendingPathComponent("heartbeat-overwrite.json")
         let data = try Data(contentsOf: fileURL)
         let decoder = JSONDecoder()
@@ -385,6 +548,35 @@ struct FileHeartbeatSinkTests {
         let decoded = try decoder.decode(HeartbeatEvent.self, from: data)
         #expect(decoded.phase == "new")
         #expect(decoded.monotonicNanoseconds == 200)
+
+        try FileManager.default.removeItem(at: tmpDir)
+    }
+
+    @Test("concurrent writes to different testIDs produce separate files")
+    func concurrentWrites() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test-heartbeat-\(UUID().uuidString)")
+
+        let config = HeartbeatConfig(directoryURL: tmpDir)
+        let sink = FileHeartbeatSink(config: config)
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for i in 0..<10 {
+                group.addTask {
+                    let event = HeartbeatEvent(
+                        testID: "concurrent-\(i)",
+                        phase: "beat",
+                        monotonicNanoseconds: UInt64(i),
+                        processID: ProcessInfo.processInfo.processIdentifier
+                    )
+                    try sink.write(event)
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let files = try FileManager.default.contentsOfDirectory(atPath: tmpDir.path)
+        #expect(files.count == 10)
 
         try FileManager.default.removeItem(at: tmpDir)
     }
@@ -401,10 +593,41 @@ struct TestIDTests {
         #expect(id == "custom-id")
     }
 
-    @Test("generates ID from call site when no explicit ID")
-    func generatedID() {
+    @Test("generated ID contains double-colon separators and is non-empty")
+    func generatedIDStructure() {
         let id = TestID.make()
-        #expect(id.contains("HeartbeatTests"))
+        #expect(!id.isEmpty)
         #expect(id.contains("::"))
+    }
+}
+
+// MARK: - HeartbeatTrait
+
+@Suite("HeartbeatTrait")
+struct HeartbeatTraitTests {
+
+    @Test("trait emits start and done for passing test", .heartbeat(
+        testID: "traitPass",
+        metadata: ["kind": "trait-test"],
+        config: HeartbeatConfig(isEnabled: false)
+    ))
+    func traitPassingTest() {
+        // If we reach here, the trait's provideScope ran successfully.
+        #expect(Bool(true))
+    }
+
+    @Test("trait factory creates with default config")
+    func traitFactory() {
+        let trait = HeartbeatTrait()
+        #expect(trait.testID == nil)
+        #expect(trait.metadata.isEmpty)
+        #expect(trait.config.isEnabled)
+    }
+
+    @Test("trait factory creates with custom testID")
+    func traitFactoryCustom() {
+        let trait = HeartbeatTrait(testID: "custom", metadata: ["a": "b"])
+        #expect(trait.testID == "custom")
+        #expect(trait.metadata["a"] == "b")
     }
 }

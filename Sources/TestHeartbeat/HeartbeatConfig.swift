@@ -18,7 +18,7 @@ public struct HeartbeatConfig: Sendable {
     public var failureMode: HeartbeatFailureMode
 
     public init(
-        directoryURL: URL,
+        directoryURL: URL = URL(fileURLWithPath: "/tmp/test-heartbeat"),
         filePrefix: String = "heartbeat",
         isEnabled: Bool = true,
         includeThreadID: Bool = false,
